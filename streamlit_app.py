@@ -1,4 +1,4 @@
-# streamlit_app.py — EdgeFinder Pro (Soccer injuries mapping fix + robust Odds API)
+# streamlit_app.py — EdgeFinder Pro (Soccer + SportsDataIO Injuries)
 import os, re
 from datetime import datetime, timedelta
 import requests
@@ -10,18 +10,19 @@ st.set_page_config(page_title="EdgeFinder — Pro", layout="wide")
 # =========================
 # Secrets
 # =========================
-def require_key(name):
+def get_secret(name, required=False):
     try:
         v = (st.secrets.get(name, "") or os.getenv(name, "")).strip()
     except Exception:
         v = (os.getenv(name, "")).strip()
-    if not v:
+    if required and not v:
         st.error(f"Missing {name}. Add it in Streamlit → Settings → Secrets.")
         st.stop()
     return v
 
-ODDS_API_KEY  = require_key("ODDS_API_KEY")
-APISPORTS_KEY = require_key("APISPORTS_KEY")
+ODDS_API_KEY       = get_secret("ODDS_API_KEY", required=True)
+APISPORTS_KEY      = get_secret("APISPORTS_KEY", required=True)
+SPORTSDATA_API_KEY = get_secret("SPORTSDATA_API_KEY", required=False)  # optional; enables US injuries
 
 # =========================
 # HTTP helpers
@@ -69,6 +70,86 @@ def apisports_get(group: str, path: str, **params):
         return {"response": []}
     return r.json()
 
+# -------- SportsDataIO (US injuries) --------
+SDIO_SPORT_FOR_KEY = {
+    "basketball_nba": "nba",
+    "icehockey_nhl":  "nhl",
+    "baseball_mlb":   "mlb",
+    "americanfootball_nfl": "nfl",
+}
+def sdio_get(sport_slug: str, endpoint: str, **params):
+    if not SPORTSDATA_API_KEY or not sport_slug:
+        return None
+    base = f"https://api.sportsdata.io/v3/{sport_slug}/scores/json"
+    headers = {"Ocp-Apim-Subscription-Key": SPORTSDATA_API_KEY}
+    # Some accounts also accept ?key=, keep header primary
+    r = requests.get(f"{base}/{endpoint}", headers=headers, params=params, timeout=25)
+    if r.status_code != 200:
+        try:
+            msg = r.json()
+        except Exception:
+            msg = {"message": r.text}
+        st.caption(f"SportsDataIO warn {r.status_code} /{sport_slug}/{endpoint}: {str(msg)[:120]}")
+        return None
+    return r.json()
+
+@st.cache_data(ttl=6*60*60, show_spinner=False)
+def sdio_teams(sport_slug: str):
+    data = sdio_get(sport_slug, "Teams")
+    return data or []
+
+@st.cache_data(ttl=120, show_spinner=False)
+def sdio_injuries(sport_slug: str):
+    data = sdio_get(sport_slug, "Injuries")
+    return data or []
+
+def _norm(s: str) -> str:
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
+def map_team_to_sdio_key(sport_slug: str, event_team_name: str) -> str | None:
+    teams = sdio_teams(sport_slug) or []
+    tgt = _norm(event_team_name)
+    best_key, best_score = None, -1
+    for t in teams:
+        full = _norm(t.get("FullName", ""))
+        city = _norm(t.get("City", ""))
+        name = _norm(t.get("Name", ""))
+        key  = t.get("Key")
+        # scoring: exact mascot match gets a bump, then full name similarity
+        score = 0
+        if name and name in tgt: score += 50
+        if full and full == tgt: score += 100
+        # overlap bonus
+        score += len(set(full) & set(tgt)) // 3
+        if score > best_score:
+            best_score, best_key = score, key
+    return best_key
+
+def sdio_injuries_for_team(sport_key: str, team_name: str):
+    sport_slug = SDIO_SPORT_FOR_KEY.get(sport_key)
+    if not sport_slug:
+        return []
+    injuries = sdio_injuries(sport_slug) or []
+    team_key = map_team_to_sdio_key(sport_slug, team_name)
+    if not team_key:
+        return []
+    out = []
+    for row in injuries:
+        if str(row.get("Team")) == str(team_key):
+            name = row.get("Name") or row.get("PlayerName") or "Player"
+            status = row.get("InjuryStatus") or row.get("Status") or ""
+            body = row.get("InjuryBodyPart") or row.get("BodyPart") or ""
+            notes = row.get("InjuryNotes") or row.get("Notes") or ""
+            parts = [p for p in [status, body, notes] if p]
+            desc = " — ".join(parts) if parts else "Injury"
+            out.append(f"{name} — {desc}")
+    # de-dup
+    seen = set(); uniq=[]
+    for s in out:
+        if s not in seen:
+            uniq.append(s); seen.add(s)
+    return uniq[:12]
+
 # =========================
 # Sport/league grouping
 # =========================
@@ -97,7 +178,7 @@ def sports_index():
     return key_to_group, groups, leagues
 
 key_to_group, SPORT_GROUPS, LEAGUES = sports_index()
-DEFAULT_GROUP = "Soccer" if "Soccer" in SPORT_GROUPS else (SPORT_GROUPS[0] if SPORT_GROUPS else "Soccer")
+DEFAULT_GROUP = "Basketball" if "Basketball" in SPORT_GROUPS else (SPORT_GROUPS[0] if SPORT_GROUPS else "Basketball")
 
 # =========================
 # Fetchers
@@ -262,17 +343,12 @@ def rest_info(team: str, scores: list, as_of_iso: str):
     return days, b2b
 
 # =========================
-# Soccer injuries/lineups mapping (improved)
+# Soccer injuries/lineups (API-FOOTBALL)
 # =========================
-def _norm(s: str) -> str:
-    return "".join(ch for ch in s.lower() if ch.isalnum())
-
 COUNTRY_FIX = {"usa": "USA", "unitedstates": "USA", "england": "England",
                "scotland":"Scotland","wales":"Wales","northernireland":"Northern Ireland",
                "southkorea":"Korea Republic","ivorycoast":"Cote D'Ivoire"}
-
 def country_from_sport_key(sport_key: str) -> str | None:
-    # e.g. soccer_argentina_primera_division
     try:
         if not sport_key.startswith("soccer_"):
             return None
@@ -284,42 +360,30 @@ def country_from_sport_key(sport_key: str) -> str | None:
     except Exception:
         return None
 
+def _norm(s: str) -> str:
+    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
+
 def soccer_team_id(team_name: str, country_hint: str|None):
-    # Try with country filter first
     params = {"search": team_name}
-    if country_hint:
-        params["country"] = country_hint
+    if country_hint: params["country"] = country_hint
     resp = apisports_get("Soccer", "/teams", **params).get("response", [])
     if not resp and country_hint:
-        # fallback without country
         resp = apisports_get("Soccer", "/teams", search=team_name).get("response", [])
-    if not resp:
-        return None
-    # Pick best fuzzy match
+    if not resp: return None
     tgt = _norm(team_name)
     best_id, best_score = None, -1
     for row in resp:
         nm = (row.get("team") or {}).get("name","")
-        score = 0
         nrm = _norm(nm)
-        if nrm == tgt:
-            score = 100
-        else:
-            # token overlap
-            score = len(set(nrm) & set(tgt))
+        score = 100 if nrm == tgt else len(set(nrm) & set(tgt))
         if score > best_score:
-            best_score = score
-            best_id = (row.get("team") or {}).get("id")
+            best_score = score; best_id = (row.get("team") or {}).get("id")
     return best_id
 
 def soccer_fixture_id(team_id: int, date_iso: str):
-    ymd = (date_iso or "")[:10]
-    if not ymd:
-        ymd = datetime.utcnow().strftime("%Y-%m-%d")
+    ymd = (date_iso or "")[:10] or datetime.utcnow().strftime("%Y-%m-%d")
     fx = apisports_get("Soccer", "/fixtures", team=team_id, date=ymd).get("response", [])
-    if not fx:
-        return None
-    # Prefer upcoming (NS/TBD), else first
+    if not fx: return None
     for f in fx:
         stt = (f.get("fixture") or {}).get("status", {}) or {}
         if str(stt.get("short","")).upper() in {"NS","TBD"}:
@@ -329,11 +393,9 @@ def soccer_fixture_id(team_id: int, date_iso: str):
 def soccer_injuries_lineups(team_name: str, date_iso: str, sport_key: str):
     country = country_from_sport_key(sport_key)
     tid = soccer_team_id(team_name, country)
-    if not tid: 
-        return [], []
+    if not tid: return [], []
     fid = soccer_fixture_id(tid, date_iso)
-    if not fid: 
-        return [], []
+    if not fid: return [], []
     inj = apisports_get("Soccer", "/injuries", fixture=fid).get("response", [])
     line = apisports_get("Soccer", "/fixtures/lineups", fixture=fid).get("response", [])
     inj_list = []
@@ -355,8 +417,13 @@ def soccer_injuries_lineups(team_name: str, date_iso: str, sport_key: str):
     return inj_list, starters[:11]
 
 def injuries_and_lineups(group: str, team_name: str, date_iso: str, sport_key: str):
+    # Soccer via API-FOOTBALL
     if group == "Soccer":
         return soccer_injuries_lineups(team_name, date_iso, sport_key)
+    # US leagues via SportsDataIO injuries (no confirmed lineups on base plan)
+    if SPORTSDATA_API_KEY and sport_key in SDIO_SPORT_FOR_KEY:
+        injuries = sdio_injuries_for_team(sport_key, team_name)
+        return injuries, []  # no lineup feed here
     return [], []
 
 # =========================
@@ -412,9 +479,10 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
     if hh is not None:               weights.append(0.05); probs_home.append(hh)
 
     inj_adj = 0.0
+    # apply small nudges from injuries (more absences on side → negative adjustment)
     if inj_home or inj_away:
-        if len(inj_home) >= 3 and len(inj_away) < 2: inj_adj -= 0.03
-        if len(inj_away) >= 3 and len(inj_home) < 2: inj_adj += 0.03
+        if len(inj_home) >= 2 and len(inj_away) < 2: inj_adj -= 0.02
+        if len(inj_away) >= 2 and len(inj_home) < 2: inj_adj += 0.02
     if lineup_home and not lineup_away: inj_adj += 0.02
     if lineup_away and not lineup_home: inj_adj -= 0.02
 
@@ -472,11 +540,12 @@ col1, col2 = st.columns([1,1])
 with col1:
     mode_by_sport = st.toggle("Run by sport (aggregate all leagues)", value=True)
 with col2:
-    only_dk = st.toggle("DraftKings only", value=True)
+    only_dk = st.toggle("DraftKings only", value=False)
 
 st.session_state["only_book"] = "DraftKings" if only_dk else None
 
 if mode_by_sport:
+    key_to_group, SPORT_GROUPS, LEAGUES = sports_index()
     group = st.selectbox("Sport", SPORT_GROUPS, index=SPORT_GROUPS.index(DEFAULT_GROUP) if DEFAULT_GROUP in SPORT_GROUPS else 0)
 else:
     league_names = [name for _, name in LEAGUES] or ["(No leagues loaded)"]
@@ -545,9 +614,9 @@ else:
                 when_txt = fmt_time(ev.get("commence_time"))
                 odds_line = f"{home} {dec_home if dec_home is not None else '—'} | {away} {dec_away if dec_away is not None else '—'}"
 
-                # ball emoji for consistency
+                ball = "🏀" if ev.get("sport_key","").startswith("basketball_") else "⚽️" if ev.get("sport_key","").startswith("soccer_") else "🎯"
                 st.markdown(
-                    f"🏀 **{away} vs {home}**\n"
+                    f"{ball} **{away} vs {home}**\n"
                     f"───────────────────────────────────────\n"
                     f"📅 {when_txt}\n"
                     f"📈 **Odds (best price):** {odds_line}\n"
