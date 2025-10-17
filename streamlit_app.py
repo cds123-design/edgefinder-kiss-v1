@@ -1,15 +1,15 @@
-# streamlit_app.py — EdgeFinder Pro (Injuries/Lineups + Sport Fix, Robust markets)
-import os
+# streamlit_app.py — EdgeFinder Pro (Soccer injuries mapping fix + robust Odds API)
+import os, re
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="EdgeFinder — Pro (Injuries/Lineups + Sport Fix)", layout="wide")
+st.set_page_config(page_title="EdgeFinder — Pro", layout="wide")
 
-# ---------------------------------------------------------------------
-# Secrets (required)
-# ---------------------------------------------------------------------
+# =========================
+# Secrets
+# =========================
 def require_key(name):
     try:
         v = (st.secrets.get(name, "") or os.getenv(name, "")).strip()
@@ -23,13 +23,12 @@ def require_key(name):
 ODDS_API_KEY  = require_key("ODDS_API_KEY")
 APISPORTS_KEY = require_key("APISPORTS_KEY")
 
-# ---------------------------------------------------------------------
+# =========================
 # HTTP helpers
-# ---------------------------------------------------------------------
+# =========================
 def odds_get(path, **params):
     url = "https://api.the-odds-api.com" + path
-    # prune None params
-    params = {k:v for k,v in params.items() if v is not None and v != ""}
+    params = {k:v for k,v in params.items() if v not in (None, "", [])}
     r = requests.get(url, params={"apiKey": ODDS_API_KEY, **params}, timeout=25)
     if r.status_code == 200:
         used = r.headers.get("x-requests-used")
@@ -38,19 +37,13 @@ def odds_get(path, **params):
         if used is not None:
             st.caption(f"Odds API usage: {{'X-Requests-Remaining': '{remaining}', 'X-Requests-Used': '{used}', 'X-Requests-Last': '{last}'}}")
         return r.json()
-    # Non-200: try to parse message
     try:
-        err = r.json()
-        msg = err.get("message", r.text)
+        msg = r.json().get("message", r.text)
     except Exception:
-        err = {"message": r.text}
         msg = r.text
-    # For 422 and similar, don't kill the whole app—return empty and warn
-    if r.status_code in (400, 401, 403, 404, 409, 422):
-        st.caption(f"Odds API {r.status_code} for {path}: {str(msg)[:200]} (continuing)")
-        # Return empty list where callers expect a list
+    if r.status_code in (400,401,403,404,409,422):
+        st.caption(f"Odds API {r.status_code} {path}: {str(msg)[:160]} (continuing)")
         return []
-    # Anything else: stop
     st.error(f"Odds API error {r.status_code}: {str(msg)[:300]}")
     st.stop()
 
@@ -61,7 +54,6 @@ APISPORTS_BASE = {
     "Baseball":           "https://v1.baseball.api-sports.io",
     "American Football":  "https://v1.american-football.api-sports.io",
 }
-
 def apisports_get(group: str, path: str, **params):
     base = APISPORTS_BASE.get(group)
     if not base:
@@ -77,9 +69,9 @@ def apisports_get(group: str, path: str, **params):
         return {"response": []}
     return r.json()
 
-# ---------------------------------------------------------------------
-# Grouping
-# ---------------------------------------------------------------------
+# =========================
+# Sport/league grouping
+# =========================
 PREFIX_GROUPS = [
     ("basketball_", "Basketball"),
     ("americanfootball_", "American Football"),
@@ -87,7 +79,6 @@ PREFIX_GROUPS = [
     ("baseball_", "Baseball"),
     ("soccer_", "Soccer"),
 ]
-
 def group_from_key(key: str) -> str:
     k = key or ""
     for pref, grp in PREFIX_GROUPS:
@@ -98,7 +89,6 @@ def group_from_key(key: str) -> str:
 @st.cache_data(ttl=12*60*60, show_spinner=False)
 def sports_index():
     data = odds_get("/v4/sports")
-    # data might be [] if upstream hiccups
     if not isinstance(data, list):
         data = []
     key_to_group = {d.get("key",""): (d.get("group") or group_from_key(d.get("key",""))) for d in data if d.get("key")}
@@ -107,32 +97,33 @@ def sports_index():
     return key_to_group, groups, leagues
 
 key_to_group, SPORT_GROUPS, LEAGUES = sports_index()
-DEFAULT_GROUP = "Basketball" if "Basketball" in SPORT_GROUPS else (SPORT_GROUPS[0] if SPORT_GROUPS else "Basketball")
+DEFAULT_GROUP = "Soccer" if "Soccer" in SPORT_GROUPS else (SPORT_GROUPS[0] if SPORT_GROUPS else "Soccer")
 
-# ---------------------------------------------------------------------
-# Fetchers (robust: try multiple markets)
-# ---------------------------------------------------------------------
+# =========================
+# Fetchers
+# =========================
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_league_robust(sport_key, regions="us", markets_try=("h2h","spreads","totals")):
+    out = []
     for m in markets_try:
         data = odds_get(f"/v4/sports/{sport_key}/odds", regions=regions, markets=m, oddsFormat="decimal")
         if isinstance(data, list) and data:
-            return data
-    # last attempt without explicit markets (let API default or return empty)
-    data = odds_get(f"/v4/sports/{sport_key}/odds", regions=regions, oddsFormat="decimal")
-    return data if isinstance(data, list) else []
+            out.extend(data)
+            break
+    if not out:
+        data = odds_get(f"/v4/sports/{sport_key}/odds", regions=regions, oddsFormat="decimal")
+        if isinstance(data, list) and data:
+            out.extend(data)
+    return out
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_scores(sport_key: str, days_from: int = 120):
-    try:
-        data = odds_get(f"/v4/sports/{sport_key}/scores", daysFrom=days_from, dateFormat="iso")
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
+    data = odds_get(f"/v4/sports/{sport_key}/scores", daysFrom=days_from, dateFormat="iso")
+    return data if isinstance(data, list) else []
 
-# ---------------------------------------------------------------------
+# =========================
 # Utilities
-# ---------------------------------------------------------------------
+# =========================
 def fmt_time(iso):
     try:
         t = datetime.fromisoformat((iso or "").replace("Z", "+00:00")).astimezone()
@@ -185,9 +176,9 @@ def conf_meter(p):
     blocks = max(0, min(10, int(round(p * 10))))
     return "■" * blocks + "□" * (10 - blocks)
 
-# ---------------------------------------------------------------------
+# =========================
 # Scores-derived features
-# ---------------------------------------------------------------------
+# =========================
 def compute_last_n(team: str, scores: list, n: int = 10):
     games = [g for g in scores if g.get("completed") and team in (g.get("teams") or [g.get("home_team"), g.get("away_team")])]
     games.sort(key=lambda g: g.get("commence_time") or "", reverse=True)
@@ -270,36 +261,79 @@ def rest_info(team: str, scores: list, as_of_iso: str):
     b2b = (as_of - last_time) <= timedelta(hours=36)
     return days, b2b
 
-# ---------------------------------------------------------------------
-# API-SPORTS helpers (Soccer: fixture-based injuries + lineups)
-# ---------------------------------------------------------------------
-def soccer_team_id(team_name: str):
+# =========================
+# Soccer injuries/lineups mapping (improved)
+# =========================
+def _norm(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+COUNTRY_FIX = {"usa": "USA", "unitedstates": "USA", "england": "England",
+               "scotland":"Scotland","wales":"Wales","northernireland":"Northern Ireland",
+               "southkorea":"Korea Republic","ivorycoast":"Cote D'Ivoire"}
+
+def country_from_sport_key(sport_key: str) -> str | None:
+    # e.g. soccer_argentina_primera_division
     try:
-        resp = apisports_get("Soccer", "/teams", search=team_name)
-        arr = resp.get("response", [])
-        if not arr: return None
-        return (arr[0].get("team") or {}).get("id")
+        if not sport_key.startswith("soccer_"):
+            return None
+        parts = sport_key.split("_")
+        if len(parts) < 3:
+            return None
+        c_raw = parts[1].replace("-", "").lower()
+        return COUNTRY_FIX.get(c_raw, parts[1].replace("-", " ").title())
     except Exception:
         return None
+
+def soccer_team_id(team_name: str, country_hint: str|None):
+    # Try with country filter first
+    params = {"search": team_name}
+    if country_hint:
+        params["country"] = country_hint
+    resp = apisports_get("Soccer", "/teams", **params).get("response", [])
+    if not resp and country_hint:
+        # fallback without country
+        resp = apisports_get("Soccer", "/teams", search=team_name).get("response", [])
+    if not resp:
+        return None
+    # Pick best fuzzy match
+    tgt = _norm(team_name)
+    best_id, best_score = None, -1
+    for row in resp:
+        nm = (row.get("team") or {}).get("name","")
+        score = 0
+        nrm = _norm(nm)
+        if nrm == tgt:
+            score = 100
+        else:
+            # token overlap
+            score = len(set(nrm) & set(tgt))
+        if score > best_score:
+            best_score = score
+            best_id = (row.get("team") or {}).get("id")
+    return best_id
 
 def soccer_fixture_id(team_id: int, date_iso: str):
-    try:
-        ymd = (date_iso or "")[:10]
-        fx = apisports_get("Soccer", "/fixtures", team=team_id, date=ymd).get("response", [])
-        if not fx: return None
-        for f in fx:
-            stt = (f.get("fixture") or {}).get("status", {}) or {}
-            if str(stt.get("short","")).upper() in {"NS","TBD"}:
-                return (f.get("fixture") or {}).get("id")
-        return (fx[0].get("fixture") or {}).get("id")
-    except Exception:
+    ymd = (date_iso or "")[:10]
+    if not ymd:
+        ymd = datetime.utcnow().strftime("%Y-%m-%d")
+    fx = apisports_get("Soccer", "/fixtures", team=team_id, date=ymd).get("response", [])
+    if not fx:
         return None
+    # Prefer upcoming (NS/TBD), else first
+    for f in fx:
+        stt = (f.get("fixture") or {}).get("status", {}) or {}
+        if str(stt.get("short","")).upper() in {"NS","TBD"}:
+            return (f.get("fixture") or {}).get("id")
+    return (fx[0].get("fixture") or {}).get("id")
 
-def soccer_injuries_lineups(team_name: str, date_iso: str):
-    tid = soccer_team_id(team_name)
-    if not tid: return [], []
+def soccer_injuries_lineups(team_name: str, date_iso: str, sport_key: str):
+    country = country_from_sport_key(sport_key)
+    tid = soccer_team_id(team_name, country)
+    if not tid: 
+        return [], []
     fid = soccer_fixture_id(tid, date_iso)
-    if not fid: return [], []
+    if not fid: 
+        return [], []
     inj = apisports_get("Soccer", "/injuries", fixture=fid).get("response", [])
     line = apisports_get("Soccer", "/fixtures/lineups", fixture=fid).get("response", [])
     inj_list = []
@@ -320,14 +354,14 @@ def soccer_injuries_lineups(team_name: str, date_iso: str):
         starters = [(p.get("player") or {}).get("name") for p in pick.get("startXI", []) if (p.get("player") or {}).get("name")]
     return inj_list, starters[:11]
 
-def injuries_and_lineups(group: str, team_name: str, date_iso: str):
+def injuries_and_lineups(group: str, team_name: str, date_iso: str, sport_key: str):
     if group == "Soccer":
-        return soccer_injuries_lineups(team_name, date_iso)
+        return soccer_injuries_lineups(team_name, date_iso, sport_key)
     return [], []
 
-# ---------------------------------------------------------------------
-# Pro algorithm
-# ---------------------------------------------------------------------
+# =========================
+# Core model
+# =========================
 def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None, elo_table=None, only_book=None):
     group = group_from_key(sport_key)
     when_iso = event.get("commence_time") or ""
@@ -366,8 +400,8 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
         rest_h, b2b_h = rest_info(home_team, scores_cache, as_of)
         rest_a, b2b_a = rest_info(away_team, scores_cache, as_of)
 
-    inj_home, lineup_home = injuries_and_lineups(group, home_team, when_iso)
-    inj_away, lineup_away = injuries_and_lineups(group, away_team, when_iso)
+    inj_home, lineup_home = injuries_and_lineups(group, home_team, when_iso, sport_key)
+    inj_away, lineup_away = injuries_and_lineups(group, away_team, when_iso, sport_key)
 
     weights, probs_home = [], []
     if mh is not None:               weights.append(0.45); probs_home.append(mh)
@@ -419,16 +453,16 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
     if lineup_home: reasons.append(f"Probable starters {home_team}: " + ", ".join(lineup_home[:5]) + ("..." if len(lineup_home)>5 else ""))
     if lineup_away: reasons.append(f"Probable starters {away_team}: " + ", ".join(lineup_away[:5]) + ("..." if len(lineup_away)>5 else ""))
     if pick_team == home_team:
-        reasons.append(f"Home-court advantage favors {home_team}")
+        reasons.append(f"Home advantage favors {home_team}")
     else:
         reasons.append(f"{pick_team} favored despite travel")
 
     return {"pick_team": pick_team, "conf": float(conf), "reasons": reasons}
 
-# ---------------------------------------------------------------------
+# =========================
 # UI
-# ---------------------------------------------------------------------
-st.title("EdgeFinder — Pro (Injuries/Lineups + Sport Fix)")
+# =========================
+st.title("EdgeFinder — Pro")
 
 regions_map = {"US":"us", "UK":"uk", "EU":"eu", "AU":"au"}
 regions_sel = st.multiselect("Regions", ["US","UK","EU","AU"], default=["US","EU"])
@@ -511,6 +545,7 @@ else:
                 when_txt = fmt_time(ev.get("commence_time"))
                 odds_line = f"{home} {dec_home if dec_home is not None else '—'} | {away} {dec_away if dec_away is not None else '—'}"
 
+                # ball emoji for consistency
                 st.markdown(
                     f"🏀 **{away} vs {home}**\n"
                     f"───────────────────────────────────────\n"
@@ -520,7 +555,7 @@ else:
                     f"🟢 **Confidence Meter:** {conf_meter(conf or 0)}\n\n"
                     f"**💬 Detailed Reasoning:**"
                 )
-                for r in reasons[:10]:
+                for r in reasons[:12]:
                     st.markdown(f" • {r}")
                 verdict = "Strong" if (conf or 0) >= 0.65 else ("Medium" if (conf or 0) >= 0.55 else "Lean")
                 st.markdown(f"───────────────────────────────────────\n✅ **EdgeFinder Model Verdict:** {verdict} edge for **{pick_team}**")
