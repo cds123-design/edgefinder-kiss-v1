@@ -1,4 +1,4 @@
-# streamlit_app.py — EdgeFinder Pro (Soccer + SportsDataIO Injuries)
+# streamlit_app.py — EdgeFinder Pro (NBA/US injuries fix + Soccer injuries/lineups)
 import os, re
 from datetime import datetime, timedelta
 import requests
@@ -43,6 +43,7 @@ def odds_get(path, **params):
     except Exception:
         msg = r.text
     if r.status_code in (400,401,403,404,409,422):
+        # Soft-fail and keep going
         st.caption(f"Odds API {r.status_code} {path}: {str(msg)[:160]} (continuing)")
         return []
     st.error(f"Odds API error {r.status_code}: {str(msg)[:300]}")
@@ -62,15 +63,11 @@ def apisports_get(group: str, path: str, **params):
     headers = {"x-apisports-key": APISPORTS_KEY}
     r = requests.get(base + path, headers=headers, params=params, timeout=25)
     if r.status_code != 200:
-        try:
-            err = r.json()
-        except Exception:
-            err = {"message": r.text}
-        st.caption(f"API-SPORTS warn {r.status_code} {path}: {str(err)[:120]}")
+        # Soft-fail
         return {"response": []}
     return r.json()
 
-# -------- SportsDataIO (US injuries) --------
+# -------- SportsDataIO (US injuries via Players?injured=true) --------
 SDIO_SPORT_FOR_KEY = {
     "basketball_nba": "nba",
     "icehockey_nhl":  "nhl",
@@ -82,25 +79,22 @@ def sdio_get(sport_slug: str, endpoint: str, **params):
         return None
     base = f"https://api.sportsdata.io/v3/{sport_slug}/scores/json"
     headers = {"Ocp-Apim-Subscription-Key": SPORTSDATA_API_KEY}
-    # Some accounts also accept ?key=, keep header primary
     r = requests.get(f"{base}/{endpoint}", headers=headers, params=params, timeout=25)
     if r.status_code != 200:
-        try:
-            msg = r.json()
-        except Exception:
-            msg = {"message": r.text}
-        st.caption(f"SportsDataIO warn {r.status_code} /{sport_slug}/{endpoint}: {str(msg)[:120]}")
         return None
-    return r.json()
+    try:
+        return r.json()
+    except Exception:
+        return None
 
 @st.cache_data(ttl=6*60*60, show_spinner=False)
 def sdio_teams(sport_slug: str):
-    data = sdio_get(sport_slug, "Teams")
-    return data or []
+    return sdio_get(sport_slug, "Teams") or []
 
-@st.cache_data(ttl=120, show_spinner=False)
-def sdio_injuries(sport_slug: str):
-    data = sdio_get(sport_slug, "Injuries")
+@st.cache_data(ttl=60, show_spinner=False)
+def sdio_players_injured(sport_slug: str):
+    # Works for nba/nhl/mlb/nfl
+    data = sdio_get(sport_slug, "Players", injured="true")
     return data or []
 
 def _norm(s: str) -> str:
@@ -115,10 +109,9 @@ def map_team_to_sdio_key(sport_slug: str, event_team_name: str) -> str | None:
         city = _norm(t.get("City", ""))
         name = _norm(t.get("Name", ""))
         key  = t.get("Key")
-        # scoring: exact mascot match gets a bump, then full name similarity
         score = 0
         if name and name in tgt: score += 50
-        if full and full == tgt: score += 100
+        if full and (full == tgt or full in tgt or tgt in full): score += 100
         # overlap bonus
         score += len(set(full) & set(tgt)) // 3
         if score > best_score:
@@ -129,22 +122,24 @@ def sdio_injuries_for_team(sport_key: str, team_name: str):
     sport_slug = SDIO_SPORT_FOR_KEY.get(sport_key)
     if not sport_slug:
         return []
-    injuries = sdio_injuries(sport_slug) or []
+    players = sdio_players_injured(sport_slug) or []
     team_key = map_team_to_sdio_key(sport_slug, team_name)
     if not team_key:
         return []
     out = []
-    for row in injuries:
-        if str(row.get("Team")) == str(team_key):
-            name = row.get("Name") or row.get("PlayerName") or "Player"
-            status = row.get("InjuryStatus") or row.get("Status") or ""
-            body = row.get("InjuryBodyPart") or row.get("BodyPart") or ""
-            notes = row.get("InjuryNotes") or row.get("Notes") or ""
-            parts = [p for p in [status, body, notes] if p]
+    for p in players:
+        if str(p.get("Team")) == str(team_key):
+            first = p.get("FirstName","")
+            last  = p.get("LastName","")
+            status = p.get("InjuryStatus") or p.get("Status") or ""
+            body   = p.get("InjuryBodyPart") or p.get("BodyPart") or ""
+            notes  = p.get("InjuryNotes") or p.get("Notes") or ""
+            parts = [x for x in [status, body, notes] if x]
             desc = " — ".join(parts) if parts else "Injury"
-            out.append(f"{name} — {desc}")
-    # de-dup
-    seen = set(); uniq=[]
+            nm = (first + " " + last).strip() or "Player"
+            out.append(f"{nm} — {desc}")
+    # Dedup
+    seen=set(); uniq=[]
     for s in out:
         if s not in seen:
             uniq.append(s); seen.add(s)
@@ -360,9 +355,6 @@ def country_from_sport_key(sport_key: str) -> str | None:
     except Exception:
         return None
 
-def _norm(s: str) -> str:
-    return "".join(ch for ch in (s or "").lower() if ch.isalnum())
-
 def soccer_team_id(team_name: str, country_hint: str|None):
     params = {"search": team_name}
     if country_hint: params["country"] = country_hint
@@ -420,10 +412,10 @@ def injuries_and_lineups(group: str, team_name: str, date_iso: str, sport_key: s
     # Soccer via API-FOOTBALL
     if group == "Soccer":
         return soccer_injuries_lineups(team_name, date_iso, sport_key)
-    # US leagues via SportsDataIO injuries (no confirmed lineups on base plan)
+    # US leagues via SportsDataIO (Players?injured=true)
     if SPORTSDATA_API_KEY and sport_key in SDIO_SPORT_FOR_KEY:
         injuries = sdio_injuries_for_team(sport_key, team_name)
-        return injuries, []  # no lineup feed here
+        return injuries, []  # no confirmed lineups in these base feeds
     return [], []
 
 # =========================
@@ -479,7 +471,6 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
     if hh is not None:               weights.append(0.05); probs_home.append(hh)
 
     inj_adj = 0.0
-    # apply small nudges from injuries (more absences on side → negative adjustment)
     if inj_home or inj_away:
         if len(inj_home) >= 2 and len(inj_away) < 2: inj_adj -= 0.02
         if len(inj_away) >= 2 and len(inj_home) < 2: inj_adj += 0.02
