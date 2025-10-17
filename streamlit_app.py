@@ -1,4 +1,4 @@
-# streamlit_app.py — EdgeFinder Pro (Injuries/Lineups + Sport Fix)
+# streamlit_app.py — EdgeFinder Pro (Injuries/Lineups + Sport Fix, Robust markets)
 import os
 from datetime import datetime, timedelta
 import requests
@@ -28,21 +28,31 @@ APISPORTS_KEY = require_key("APISPORTS_KEY")
 # ---------------------------------------------------------------------
 def odds_get(path, **params):
     url = "https://api.the-odds-api.com" + path
+    # prune None params
+    params = {k:v for k,v in params.items() if v is not None and v != ""}
     r = requests.get(url, params={"apiKey": ODDS_API_KEY, **params}, timeout=25)
-    if r.status_code != 200:
-        try:
-            err = r.json()
-        except Exception:
-            err = {"message": r.text}
-        st.error(f"Odds API error {r.status_code}: {err.get('message', r.text)[:300]}")
-        st.stop()
-    # show usage headers if present
-    used = r.headers.get("x-requests-used")
-    remaining = r.headers.get("x-requests-remaining")
-    last = r.headers.get("x-requests-last")
-    if used is not None:
-        st.caption(f"Odds API usage: {{'X-Requests-Remaining': '{remaining}', 'X-Requests-Used': '{used}', 'X-Requests-Last': '{last}'}}")
-    return r.json()
+    if r.status_code == 200:
+        used = r.headers.get("x-requests-used")
+        remaining = r.headers.get("x-requests-remaining")
+        last = r.headers.get("x-requests-last")
+        if used is not None:
+            st.caption(f"Odds API usage: {{'X-Requests-Remaining': '{remaining}', 'X-Requests-Used': '{used}', 'X-Requests-Last': '{last}'}}")
+        return r.json()
+    # Non-200: try to parse message
+    try:
+        err = r.json()
+        msg = err.get("message", r.text)
+    except Exception:
+        err = {"message": r.text}
+        msg = r.text
+    # For 422 and similar, don't kill the whole app—return empty and warn
+    if r.status_code in (400, 401, 403, 404, 409, 422):
+        st.caption(f"Odds API {r.status_code} for {path}: {str(msg)[:200]} (continuing)")
+        # Return empty list where callers expect a list
+        return []
+    # Anything else: stop
+    st.error(f"Odds API error {r.status_code}: {str(msg)[:300]}")
+    st.stop()
 
 APISPORTS_BASE = {
     "Soccer":             "https://v3.football.api-sports.io",
@@ -59,7 +69,6 @@ def apisports_get(group: str, path: str, **params):
     headers = {"x-apisports-key": APISPORTS_KEY}
     r = requests.get(base + path, headers=headers, params=params, timeout=25)
     if r.status_code != 200:
-        # Avoid stopping the app for this; just show minimal warning
         try:
             err = r.json()
         except Exception:
@@ -89,8 +98,11 @@ def group_from_key(key: str) -> str:
 @st.cache_data(ttl=12*60*60, show_spinner=False)
 def sports_index():
     data = odds_get("/v4/sports")
-    key_to_group = {d["key"]: (d.get("group") or group_from_key(d["key"])) for d in data}
-    leagues = sorted([(d["key"], d.get("title","") or d["key"]) for d in data], key=lambda x: x[1])
+    # data might be [] if upstream hiccups
+    if not isinstance(data, list):
+        data = []
+    key_to_group = {d.get("key",""): (d.get("group") or group_from_key(d.get("key",""))) for d in data if d.get("key")}
+    leagues = sorted([(d.get("key",""), d.get("title","") or d.get("key","")) for d in data if d.get("key")], key=lambda x: x[1])
     groups = sorted(set(key_to_group.values()) | {g for _, g in PREFIX_GROUPS} | {"Other"})
     return key_to_group, groups, leagues
 
@@ -98,20 +110,23 @@ key_to_group, SPORT_GROUPS, LEAGUES = sports_index()
 DEFAULT_GROUP = "Basketball" if "Basketball" in SPORT_GROUPS else (SPORT_GROUPS[0] if SPORT_GROUPS else "Basketball")
 
 # ---------------------------------------------------------------------
-# Fetchers
+# Fetchers (robust: try multiple markets)
 # ---------------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_league(sport_key, regions="us", markets="h2h", odds_format="decimal"):
-    return odds_get(f"/v4/sports/{sport_key}/odds", regions=regions, markets=markets, oddsFormat=odds_format)
-
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_upcoming(regions="us", markets="h2h", odds_format="decimal"):
-    return odds_get("/v4/sports/upcoming/odds", regions=regions, markets=markets, oddsFormat=odds_format)
+def fetch_league_robust(sport_key, regions="us", markets_try=("h2h","spreads","totals")):
+    for m in markets_try:
+        data = odds_get(f"/v4/sports/{sport_key}/odds", regions=regions, markets=m, oddsFormat="decimal")
+        if isinstance(data, list) and data:
+            return data
+    # last attempt without explicit markets (let API default or return empty)
+    data = odds_get(f"/v4/sports/{sport_key}/odds", regions=regions, oddsFormat="decimal")
+    return data if isinstance(data, list) else []
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_scores(sport_key: str, days_from: int = 120):
     try:
-        return odds_get(f"/v4/sports/{sport_key}/scores", daysFrom=days_from, dateFormat="iso")
+        data = odds_get(f"/v4/sports/{sport_key}/scores", daysFrom=days_from, dateFormat="iso")
+        return data if isinstance(data, list) else []
     except Exception:
         return []
 
@@ -272,7 +287,6 @@ def soccer_fixture_id(team_id: int, date_iso: str):
         ymd = (date_iso or "")[:10]
         fx = apisports_get("Soccer", "/fixtures", team=team_id, date=ymd).get("response", [])
         if not fx: return None
-        # Prefer upcoming (NS/TBD), else first
         for f in fx:
             stt = (f.get("fixture") or {}).get("status", {}) or {}
             if str(stt.get("short","")).upper() in {"NS","TBD"}:
@@ -288,7 +302,6 @@ def soccer_injuries_lineups(team_name: str, date_iso: str):
     if not fid: return [], []
     inj = apisports_get("Soccer", "/injuries", fixture=fid).get("response", [])
     line = apisports_get("Soccer", "/fixtures/lineups", fixture=fid).get("response", [])
-    # Injuries
     inj_list = []
     for row in inj:
         p = row.get("player") or {}
@@ -296,7 +309,6 @@ def soccer_injuries_lineups(team_name: str, date_iso: str):
         nm = p.get("name") or "Player"
         rs = i.get("reason") or i.get("type") or "Undisclosed"
         inj_list.append(f"{nm} — {rs}")
-    # Lineups
     starters = []
     pick = None
     for L in line:
@@ -311,7 +323,6 @@ def soccer_injuries_lineups(team_name: str, date_iso: str):
 def injuries_and_lineups(group: str, team_name: str, date_iso: str):
     if group == "Soccer":
         return soccer_injuries_lineups(team_name, date_iso)
-    # Other sports: provider coverage varies; leaving empty here
     return [], []
 
 # ---------------------------------------------------------------------
@@ -321,7 +332,6 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
     group = group_from_key(sport_key)
     when_iso = event.get("commence_time") or ""
 
-    # Market odds → implied
     best = best_ml_prices(event, only_book=only_book)
     dec_home = best.get(home_team, {}).get("price")
     dec_away = best.get(away_team, {}).get("price")
@@ -329,7 +339,6 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
     if dec_home is not None and dec_away is not None:
         mh, ma = implied_from_decimal(dec_home, dec_away)
 
-    # Scores-derived signals
     eh = ea = gap = None
     fh = fa = None
     hh = None
@@ -340,7 +349,7 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
         if elo_table is None:
             elo_table = compute_elo(scores_cache)
         Rh = elo_table.get(home_team, 1500.0); Ra = elo_table.get(away_team, 1500.0)
-        eh = 1.0 / (1.0 + 10 ** ((Ra - (Rh + 30.0)) / 400.0))  # home prob
+        eh = 1.0 / (1.0 + 10 ** ((Ra - (Rh + 30.0)) / 400.0))
         ea = 1.0 - eh
         gap = Rh - Ra
 
@@ -357,11 +366,9 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
         rest_h, b2b_h = rest_info(home_team, scores_cache, as_of)
         rest_a, b2b_a = rest_info(away_team, scores_cache, as_of)
 
-    # Injuries & lineups (soccer now; others empty)
     inj_home, lineup_home = injuries_and_lineups(group, home_team, when_iso)
     inj_away, lineup_away = injuries_and_lineups(group, away_team, when_iso)
 
-    # Blend (weights)
     weights, probs_home = [], []
     if mh is not None:               weights.append(0.45); probs_home.append(mh)
     if eh is not None:               weights.append(0.25); probs_home.append(eh)
@@ -392,7 +399,6 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
     pick_team = home_team if ph >= 0.5 else away_team
     conf = ph if pick_team == home_team else (1.0 - ph)
 
-    # Reasons
     reasons = []
     if mh is not None:
         fav_price = dec_home if pick_team == home_team else dec_away
@@ -424,7 +430,6 @@ def edgefinder_predict(home_team, away_team, sport_key, event, scores_cache=None
 # ---------------------------------------------------------------------
 st.title("EdgeFinder — Pro (Injuries/Lineups + Sport Fix)")
 
-# Regions selector (fix empty basketball by widening beyond 'us')
 regions_map = {"US":"us", "UK":"uk", "EU":"eu", "AU":"au"}
 regions_sel = st.multiselect("Regions", ["US","UK","EU","AU"], default=["US","EU"])
 regions_param = ",".join(regions_map[x] for x in regions_sel) or "us"
@@ -447,25 +452,22 @@ else:
 if st.button("Refresh games", use_container_width=True):
     st.session_state.pop("events", None)
 
-# Build events list
 if "events" not in st.session_state:
     if mode_by_sport:
-        # FETCH ALL LEAGUES IN GROUP and merge
         sport_keys = [k for k,g in key_to_group.items() if g == group]
         merged = []
         for sk in sport_keys:
             try:
-                merged.extend(fetch_league(sk, regions=regions_param, markets="h2h", odds_format="decimal") or [])
+                merged.extend(fetch_league_robust(sk, regions=regions_param) or [])
             except Exception:
                 pass
         st.session_state["events"] = merged
     else:
         key = name_to_key.get(league, None) if not mode_by_sport else None
-        st.session_state["events"] = fetch_league(key, regions=regions_param, markets="h2h", odds_format="decimal") if key else []
+        st.session_state["events"] = fetch_league_robust(key, regions=regions_param) if key else []
 
 events = st.session_state.get("events", [])
 
-# Scores cache per sport of first event (for Elo/form/H2H/rest)
 scores_cache = []
 elo_table = {}
 if events:
